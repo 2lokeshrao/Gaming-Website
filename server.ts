@@ -93,7 +93,7 @@ app.use(generalLimiter);
 
 
 
-// In-Memory Database State
+// In-Memory State Cache (hydrated from MySQL)
 let statePlatforms: GamingPlatform[] = [...initialPlatforms];
 let stateConfig: GlobalConfig = { ...initialGlobalConfig };
 let stateSubPartners: SubPartnerApplication[] = [];
@@ -101,150 +101,459 @@ let stateCustomPages: any[] = [];
 let stateStats: AnalyticsStats = { totalVisits: 0, totalClicks: 0, totalPromoCopies: 0, totalSubPartnerApps: 0, platformStats: {} };
 let stateTrackLogs: TrackLog[] = [];
 
-// 1. FLAT FILE JSON STORAGE (Since MySQL is not running)
-const DATA_FILE = path.join(process.cwd(), 'app_data.json');
+// ==========================================
+// 1. MYSQL DATABASE CONNECTION & QUERIES
+// ==========================================
+const dbHost = process.env.DB_HOST || 'localhost';
+const dbPort = parseInt(process.env.DB_PORT || '3306', 10);
+const dbUser = process.env.DB_USER || 'root';
+const dbPassword = process.env.DB_PASSWORD || process.env.DB_PASS || '';
+const dbName = process.env.DB_NAME || 'bonuspromocode_db';
 
-async function readDataFile() {
-  try {
-    if (!fs.existsSync(DATA_FILE)) {
-      await fs.promises.writeFile(DATA_FILE, JSON.stringify({
-        platforms: {},
-        settings: {},
-        custom_pages: {},
-        sub_partners: {}
-      }));
-    }
-    const raw = await fs.promises.readFile(DATA_FILE, 'utf8');
-    return JSON.parse(raw);
-  } catch (e) {
-    logger.error('Error reading data file', e);
-    return { platforms: {}, settings: {}, custom_pages: {}, sub_partners: {} };
-  }
-}
+let dbPool: mysql.Pool | null = null;
+let isDbConnected = false;
 
-async function writeDataFile(data) {
-  try {
-    await fs.promises.writeFile(DATA_FILE, JSON.stringify(data, null, 2));
-  } catch (e) {
-    logger.error('Error writing data file', e);
-  }
-}
-
-async function setDoc(collection, docId, data) {
-  const db = await readDataFile();
-  if (!db[collection]) db[collection] = {};
-  db[collection][docId] = data;
-  await writeDataFile(db);
-}
-
-async function getCollection(collection) {
-  const db = await readDataFile();
-  if (!db[collection]) return [];
-  return Object.values(db[collection]);
-}
-
-async function getDoc(collection, docId) {
-  const db = await readDataFile();
-  if (!db[collection]) return null;
-  return db[collection][docId] || null;
-}
-
-async function updateDoc(collection, docId, updates) {
-  const existing = await getDoc(collection, docId);
-  if (existing) {
-    await setDoc(collection, docId, { ...existing, ...updates });
-  }
-}
-
-async function saveState() {
-  try {
-    const db = await readDataFile();
-    
-    // 1. Sync Platforms
-    if (Array.isArray(statePlatforms)) {
-      db.platforms = {};
-      for (const p of statePlatforms) {
-        db.platforms[p.id] = p;
-      }
-    }
-
-    // 2. Sync Config
-    if (stateConfig) {
-      db.settings = db.settings || {};
-      db.settings['globalConfig'] = stateConfig;
-    }
-
-    // 3. Sync Custom Pages
-    if (Array.isArray(stateCustomPages)) {
-      db.custom_pages = {};
-      for (const cp of stateCustomPages) {
-        db.custom_pages[cp.slug] = cp;
-      }
-    }
-
-    // 4. Sync Sub Partners
-    if (Array.isArray(stateSubPartners)) {
-      db.sub_partners = {};
-      for (const sp of stateSubPartners) {
-        db.sub_partners[sp.id] = sp;
-      }
-    }
-
-    await writeDataFile(db);
-    logger.info("Successfully synced all in-memory state to JSON database.");
-  } catch (e) {
-    logger.error("saveState error:", e);
-  }
-}
-
-async function loadState() {
-  try {
-    // 1. Load or Seed Platforms
-    const pSnap = await getCollection('platforms');
-    if (pSnap.length > 0) {
-      statePlatforms = pSnap as GamingPlatform[];
+function getDbPool(): mysql.Pool {
+  if (!dbPool) {
+    if (process.env.DATABASE_URL) {
+      dbPool = mysql.createPool({
+        uri: process.env.DATABASE_URL,
+        waitForConnections: true,
+        connectionLimit: 10,
+        queueLimit: 0,
+        enableKeepAlive: true,
+        keepAliveInitialDelay: 0
+      });
     } else {
-      logger.info("Database empty: Seeding initial platforms...");
+      dbPool = mysql.createPool({
+        host: dbHost,
+        port: dbPort,
+        user: dbUser,
+        password: dbPassword,
+        database: dbName,
+        waitForConnections: true,
+        connectionLimit: 10,
+        queueLimit: 0,
+        enableKeepAlive: true,
+        keepAliveInitialDelay: 0
+      });
+    }
+  }
+  return dbPool;
+}
+
+// Auto-create MySQL Tables if they don't exist
+async function initDatabaseTables() {
+  try {
+    const pool = getDbPool();
+    const conn = await pool.getConnection();
+    isDbConnected = true;
+    logger.info(`[MySQL] Successfully connected to database "${dbName}" at ${dbHost}:${dbPort}`);
+    conn.release();
+
+    // 1. Global Config Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS global_config (
+        id INT PRIMARY KEY DEFAULT 1,
+        config_json LONGTEXT NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    // 2. Gaming Platforms Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS gaming_platforms (
+        id VARCHAR(100) PRIMARY KEY,
+        slug VARCHAR(150) NOT NULL,
+        name VARCHAR(150) NOT NULL,
+        logoUrl MEDIUMTEXT,
+        rating DECIMAL(3,1) DEFAULT 0.0,
+        starRating INT DEFAULT 5,
+        bonusText VARCHAR(255),
+        promoCode VARCHAR(100),
+        rawAffiliateUrl MEDIUMTEXT,
+        masterPartnerUrl MEDIUMTEXT,
+        claimUrl MEDIUMTEXT,
+        reviewContent LONGTEXT,
+        isFeatured BOOLEAN DEFAULT FALSE,
+        featuredRank INT DEFAULT NULL,
+        isActive BOOLEAN DEFAULT TRUE,
+        clicksCount INT DEFAULT 0,
+        copiesCount INT DEFAULT 0,
+        category VARCHAR(100),
+        bonusTitle VARCHAR(255),
+        minDeposit VARCHAR(100),
+        metaTitle VARCHAR(255),
+        metaDescription TEXT,
+        metaKeywords TEXT,
+        averageUserRating DECIMAL(3,1) DEFAULT 0.0,
+        totalReviewsCount INT DEFAULT 0,
+        platform_json LONGTEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    // 3. Sub-Partner Applications Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sub_partner_applications (
+        id VARCHAR(100) PRIMARY KEY,
+        fullName VARCHAR(150) NOT NULL,
+        email VARCHAR(150) NOT NULL,
+        whatsapp VARCHAR(100) NOT NULL,
+        platformId VARCHAR(100),
+        platformName VARCHAR(150),
+        trafficSource VARCHAR(255),
+        estimatedMonthlyPlayers VARCHAR(100),
+        status ENUM('pending', 'approved', 'contacted') DEFAULT 'pending',
+        appliedAt VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    // 4. Custom Pages Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS custom_pages (
+        id VARCHAR(100) PRIMARY KEY,
+        slug VARCHAR(150) UNIQUE NOT NULL,
+        title VARCHAR(255) NOT NULL,
+        content LONGTEXT,
+        isActive BOOLEAN DEFAULT TRUE,
+        metaTitle VARCHAR(255),
+        metaDescription TEXT,
+        page_json LONGTEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    // 5. Track Logs Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS track_logs (
+        id VARCHAR(100) PRIMARY KEY,
+        eventType VARCHAR(50) NOT NULL,
+        platformId VARCHAR(100),
+        platformName VARCHAR(150),
+        timestamp VARCHAR(100),
+        country VARCHAR(100),
+        ip VARCHAR(100),
+        userAgent TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    // 6. Analytics Stats Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS analytics_stats (
+        id INT PRIMARY KEY DEFAULT 1,
+        totalVisits INT DEFAULT 0,
+        totalClicks INT DEFAULT 0,
+        totalPromoCopies INT DEFAULT 0,
+        totalSubPartnerApps INT DEFAULT 0,
+        platformStats LONGTEXT,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    // 7. Platform Feedbacks Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS platform_feedbacks (
+        id VARCHAR(100) PRIMARY KEY,
+        platformId VARCHAR(100) NOT NULL,
+        platformName VARCHAR(150),
+        userName VARCHAR(150) NOT NULL,
+        userEmail VARCHAR(150),
+        rating INT NOT NULL,
+        comment TEXT,
+        createdAt VARCHAR(100),
+        isApproved BOOLEAN DEFAULT FALSE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    logger.info('[MySQL] All database tables verified and ready.');
+    await loadStateFromDb();
+  } catch (err: any) {
+    isDbConnected = false;
+    logger.warn(`[MySQL Notice] Could not connect to MySQL server (${err.message}). Running with in-memory state. When deploying to Hostinger, provide DB_HOST, DB_USER, DB_PASSWORD, DB_NAME in environment variables.`);
+  }
+}
+
+// Load State from MySQL Database
+async function loadStateFromDb() {
+  try {
+    const pool = getDbPool();
+
+    // 1. Load Platforms
+    const [platformRows]: any = await pool.query('SELECT * FROM gaming_platforms');
+    if (Array.isArray(platformRows) && platformRows.length > 0) {
+      statePlatforms = platformRows.map((row: any) => {
+        if (row.platform_json) {
+          try { return JSON.parse(row.platform_json); } catch (e) { /* fallback */ }
+        }
+        return {
+          id: row.id,
+          slug: row.slug,
+          name: row.name,
+          logoUrl: row.logoUrl,
+          rating: Number(row.rating) || 4.5,
+          starRating: Number(row.starRating) || 5,
+          bonusText: row.bonusText,
+          promoCode: row.promoCode,
+          rawAffiliateUrl: row.rawAffiliateUrl,
+          masterPartnerUrl: row.masterPartnerUrl,
+          claimUrl: row.claimUrl,
+          reviewContent: row.reviewContent,
+          isFeatured: Boolean(row.isFeatured),
+          featuredRank: row.featuredRank,
+          isActive: Boolean(row.isActive),
+          clicksCount: Number(row.clicksCount) || 0,
+          copiesCount: Number(row.copiesCount) || 0,
+          category: row.category || 'all',
+          bonusTitle: row.bonusTitle,
+          minDeposit: row.minDeposit,
+          metaTitle: row.metaTitle,
+          metaDescription: row.metaDescription,
+          metaKeywords: row.metaKeywords,
+          averageUserRating: Number(row.averageUserRating) || 4.5,
+          totalReviewsCount: Number(row.totalReviewsCount) || 0
+        };
+      });
+      logger.info(`[MySQL] Loaded ${statePlatforms.length} platforms from database.`);
+    } else {
+      logger.info('[MySQL] Seeding default platforms into MySQL database...');
       for (const p of initialPlatforms) {
-        await setDoc('platforms', p.id, p);
+        await pool.query(
+          `INSERT INTO gaming_platforms 
+           (id, slug, name, logoUrl, rating, starRating, bonusText, promoCode, rawAffiliateUrl, masterPartnerUrl, claimUrl, reviewContent, isFeatured, featuredRank, isActive, clicksCount, copiesCount, category, bonusTitle, minDeposit, metaTitle, metaDescription, metaKeywords, averageUserRating, totalReviewsCount, platform_json) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE name=VALUES(name), platform_json=VALUES(platform_json)`,
+          [
+            p.id, p.slug, p.name, p.logoUrl, p.rating, p.starRating, p.bonusText, p.promoCode,
+            p.rawAffiliateUrl, p.masterPartnerUrl, p.claimUrl, p.reviewContent, p.isFeatured,
+            p.featuredRank || null, p.isActive, p.clicksCount || 0, p.copiesCount || 0,
+            p.category || 'all', p.bonusTitle || '', p.minDeposit || '', p.metaTitle || '',
+            p.metaDescription || '', p.metaKeywords || '', p.averageUserRating || 4.5,
+            p.totalReviewsCount || 0, JSON.stringify(p)
+          ]
+        );
       }
       statePlatforms = [...initialPlatforms];
     }
 
-    // 2. Load or Seed Config
-    const cSnap = await getDoc('settings', 'globalConfig');
-    if (cSnap) {
-      stateConfig = cSnap as GlobalConfig;
+    // 2. Load Global Config
+    const [configRows]: any = await pool.query('SELECT config_json FROM global_config WHERE id = 1 LIMIT 1');
+    if (Array.isArray(configRows) && configRows.length > 0 && configRows[0].config_json) {
+      try {
+        stateConfig = JSON.parse(configRows[0].config_json);
+        logger.info('[MySQL] Loaded global config from database.');
+      } catch (e) {
+        logger.error('[MySQL] Error parsing config_json', e);
+      }
     } else {
-      logger.info("Database empty: Seeding initial global config...");
-      await setDoc('settings', 'globalConfig', initialGlobalConfig);
+      logger.info('[MySQL] Seeding default global config into MySQL database...');
+      await pool.query(
+        'INSERT INTO global_config (id, config_json) VALUES (1, ?) ON DUPLICATE KEY UPDATE config_json=VALUES(config_json)',
+        [JSON.stringify(initialGlobalConfig)]
+      );
       stateConfig = { ...initialGlobalConfig };
     }
 
-    // 3. Load Sub Partners & Pages
-    const spSnap = await getCollection('sub_partners');
-    if (spSnap.length > 0) stateSubPartners = spSnap as SubPartnerApplication[];
-
-        const cpSnap = await getCollection('custom_pages');
-    stateCustomPages = cpSnap as any[];
-    
-    // Seed missing default pages
-    for (const initCp of initialCustomPages) {
-      if (!stateCustomPages.find(cp => cp.slug === initCp.slug)) {
-        logger.info(`Database missing custom page ${initCp.slug}: Seeding...`);
-        await setDoc('custom_pages', initCp.slug, initCp);
-        stateCustomPages.push(initCp);
-      }
+    // 3. Load Sub-Partners
+    const [subPartnerRows]: any = await pool.query('SELECT * FROM sub_partner_applications ORDER BY created_at DESC');
+    if (Array.isArray(subPartnerRows) && subPartnerRows.length > 0) {
+      stateSubPartners = subPartnerRows.map((r: any) => ({
+        id: r.id,
+        fullName: r.fullName,
+        email: r.email,
+        whatsapp: r.whatsapp,
+        platformId: r.platformId,
+        platformName: r.platformName,
+        trafficSource: r.trafficSource,
+        estimatedMonthlyPlayers: r.estimatedMonthlyPlayers,
+        status: r.status,
+        appliedAt: r.appliedAt
+      }));
+      logger.info(`[MySQL] Loaded ${stateSubPartners.length} sub-partner applications.`);
     }
 
-    logger.info("Loaded state from MySQL Collections.");
-  } catch (e) {
-    logger.error("Load state error:", e);
+    // 4. Load Custom Pages
+    const [pageRows]: any = await pool.query('SELECT * FROM custom_pages');
+    if (Array.isArray(pageRows) && pageRows.length > 0) {
+      stateCustomPages = pageRows.map((r: any) => {
+        if (r.page_json) {
+          try { return JSON.parse(r.page_json); } catch (e) { /* fallback */ }
+        }
+        return {
+          id: r.id,
+          slug: r.slug,
+          title: r.title,
+          content: r.content,
+          isActive: Boolean(r.isActive),
+          metaTitle: r.metaTitle,
+          metaDescription: r.metaDescription
+        };
+      });
+      logger.info(`[MySQL] Loaded ${stateCustomPages.length} custom pages.`);
+    } else {
+      logger.info('[MySQL] Seeding default custom pages into MySQL database...');
+      for (const cp of initialCustomPages) {
+        await pool.query(
+          'INSERT INTO custom_pages (id, slug, title, content, isActive, metaTitle, metaDescription, page_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE title=VALUES(title)',
+          [cp.id || cp.slug, cp.slug, cp.title, cp.content, cp.isActive, (cp as any).metaTitle || '', (cp as any).metaDescription || '', JSON.stringify(cp)]
+        );
+      }
+      stateCustomPages = [...initialCustomPages];
+    }
+
+    // 5. Load Analytics Stats
+    const [statsRows]: any = await pool.query('SELECT * FROM analytics_stats WHERE id = 1 LIMIT 1');
+    if (Array.isArray(statsRows) && statsRows.length > 0) {
+      const s = statsRows[0];
+      stateStats.totalVisits = s.totalVisits || 0;
+      stateStats.totalClicks = s.totalClicks || 0;
+      stateStats.totalPromoCopies = s.totalPromoCopies || 0;
+      stateStats.totalSubPartnerApps = s.totalSubPartnerApps || 0;
+      if (s.platformStats) {
+        try { stateStats.platformStats = JSON.parse(s.platformStats); } catch (e) { /* fallback */ }
+      }
+    }
+  } catch (err: any) {
+    logger.error('[MySQL] Error during loadStateFromDb:', err.message);
   }
 }
 
-// Ensure state is loaded asynchronously during boot
-loadState();
+// Helper: Save all platforms to MySQL
+async function savePlatformsToDb(platforms: GamingPlatform[]) {
+  try {
+    const pool = getDbPool();
+    for (const p of platforms) {
+      await pool.query(
+        `INSERT INTO gaming_platforms 
+         (id, slug, name, logoUrl, rating, starRating, bonusText, promoCode, rawAffiliateUrl, masterPartnerUrl, claimUrl, reviewContent, isFeatured, featuredRank, isActive, clicksCount, copiesCount, category, bonusTitle, minDeposit, metaTitle, metaDescription, metaKeywords, averageUserRating, totalReviewsCount, platform_json) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE 
+           slug=VALUES(slug), name=VALUES(name), logoUrl=VALUES(logoUrl), rating=VALUES(rating), starRating=VALUES(starRating),
+           bonusText=VALUES(bonusText), promoCode=VALUES(promoCode), rawAffiliateUrl=VALUES(rawAffiliateUrl),
+           masterPartnerUrl=VALUES(masterPartnerUrl), claimUrl=VALUES(claimUrl), reviewContent=VALUES(reviewContent),
+           isFeatured=VALUES(isFeatured), featuredRank=VALUES(featuredRank), isActive=VALUES(isActive),
+           clicksCount=VALUES(clicksCount), copiesCount=VALUES(copiesCount), category=VALUES(category),
+           bonusTitle=VALUES(bonusTitle), minDeposit=VALUES(minDeposit), metaTitle=VALUES(metaTitle),
+           metaDescription=VALUES(metaDescription), metaKeywords=VALUES(metaKeywords),
+           averageUserRating=VALUES(averageUserRating), totalReviewsCount=VALUES(totalReviewsCount),
+           platform_json=VALUES(platform_json)`,
+        [
+          p.id, p.slug, p.name, p.logoUrl, p.rating, p.starRating, p.bonusText, p.promoCode,
+          p.rawAffiliateUrl, p.masterPartnerUrl, p.claimUrl, p.reviewContent, p.isFeatured,
+          p.featuredRank || null, p.isActive, p.clicksCount || 0, p.copiesCount || 0,
+          p.category || 'all', p.bonusTitle || '', p.minDeposit || '', p.metaTitle || '',
+          p.metaDescription || '', p.metaKeywords || '', p.averageUserRating || 4.5,
+          p.totalReviewsCount || 0, JSON.stringify(p)
+        ]
+      );
+    }
+  } catch (err: any) {
+    logger.error('[MySQL] Error saving platforms to MySQL:', err.message);
+  }
+}
+
+// Helper: Save Global Config to MySQL
+async function saveConfigToDb(config: GlobalConfig) {
+  try {
+    const pool = getDbPool();
+    await pool.query(
+      'INSERT INTO global_config (id, config_json) VALUES (1, ?) ON DUPLICATE KEY UPDATE config_json=VALUES(config_json)',
+      [JSON.stringify(config)]
+    );
+  } catch (err: any) {
+    logger.error('[MySQL] Error saving global config to MySQL:', err.message);
+  }
+}
+
+// Helper: Save Custom Pages to MySQL
+async function saveCustomPagesToDb(pages: any[]) {
+  try {
+    const pool = getDbPool();
+    for (const cp of pages) {
+      await pool.query(
+        `INSERT INTO custom_pages (id, slug, title, content, isActive, metaTitle, metaDescription, page_json) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) 
+         ON DUPLICATE KEY UPDATE title=VALUES(title), content=VALUES(content), isActive=VALUES(isActive), metaTitle=VALUES(metaTitle), metaDescription=VALUES(metaDescription), page_json=VALUES(page_json)`,
+        [cp.id || cp.slug, cp.slug, cp.title, cp.content, cp.isActive, cp.metaTitle || '', cp.metaDescription || '', JSON.stringify(cp)]
+      );
+    }
+  } catch (err: any) {
+    logger.error('[MySQL] Error saving custom pages to MySQL:', err.message);
+  }
+}
+
+// Helper: Insert Sub-Partner Application to MySQL
+async function insertSubPartnerToDb(app: SubPartnerApplication) {
+  try {
+    const pool = getDbPool();
+    await pool.query(
+      `INSERT INTO sub_partner_applications 
+       (id, fullName, email, whatsapp, platformId, platformName, trafficSource, estimatedMonthlyPlayers, status, appliedAt) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [app.id, app.fullName, app.email, app.whatsapp, app.platformId, app.platformName, app.trafficSource, app.estimatedMonthlyPlayers, app.status, app.appliedAt]
+    );
+  } catch (err: any) {
+    logger.error('[MySQL] Error inserting sub-partner to MySQL:', err.message);
+  }
+}
+
+// Helper: Update Sub-Partner Status in MySQL
+async function updateSubPartnerStatusInDb(id: string, status: string) {
+  try {
+    const pool = getDbPool();
+    await pool.query('UPDATE sub_partner_applications SET status = ? WHERE id = ?', [status, id]);
+  } catch (err: any) {
+    logger.error('[MySQL] Error updating sub-partner status in MySQL:', err.message);
+  }
+}
+
+// Helper: Delete Sub-Partner from MySQL
+async function deleteSubPartnerFromDb(id: string) {
+  try {
+    const pool = getDbPool();
+    await pool.query('DELETE FROM sub_partner_applications WHERE id = ?', [id]);
+  } catch (err: any) {
+    logger.error('[MySQL] Error deleting sub-partner from MySQL:', err.message);
+  }
+}
+
+// Helper: Insert Track Log to MySQL
+async function insertTrackLogToDb(log: TrackLog) {
+  try {
+    const pool = getDbPool();
+    await pool.query(
+      'INSERT INTO track_logs (id, eventType, platformId, platformName, timestamp, country, ip, userAgent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [log.id, log.eventType, log.platformId, log.platformName, log.timestamp, log.country, log.ip, log.userAgent]
+    );
+  } catch (err: any) {
+    // Non-critical logging
+  }
+}
+
+// Helper: Update Stats in MySQL
+async function updateStatsInDb() {
+  try {
+    const pool = getDbPool();
+    await pool.query(
+      `INSERT INTO analytics_stats (id, totalVisits, totalClicks, totalPromoCopies, totalSubPartnerApps, platformStats) 
+       VALUES (1, ?, ?, ?, ?, ?) 
+       ON DUPLICATE KEY UPDATE 
+         totalVisits=VALUES(totalVisits), totalClicks=VALUES(totalClicks), 
+         totalPromoCopies=VALUES(totalPromoCopies), totalSubPartnerApps=VALUES(totalSubPartnerApps), 
+         platformStats=VALUES(platformStats)`,
+      [stateStats.totalVisits, stateStats.totalClicks, stateStats.totalPromoCopies, stateStats.totalSubPartnerApps, JSON.stringify(stateStats.platformStats || {})]
+    );
+  } catch (err: any) {
+    // Non-critical logging
+  }
+}
+
+// Initialize MySQL database tables on server start
+initDatabaseTables();
 
 // --- IMAGE OPTIMIZATION CDN ROUTE ---
 app.get('/api/cdn/images/:platformId.webp', async (req, res) => {
@@ -486,6 +795,7 @@ app.get('/api/postback/:platform', async (req, res) => {
   const { click_id, event, player, sum, currency, ...otherParams } = req.query;
 
   const postbackData = {
+    id: `pb_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
     platform: reqPlatform,
     click_id: click_id || null,
     event: event || 'unknown',
@@ -498,8 +808,26 @@ app.get('/api/postback/:platform', async (req, res) => {
 
   const data = { statePlatforms, stateConfig, stateSubPartners };
   try {
-    await setDoc('s2s_postbacks', Date.now().toString(), postbackData);
-logger.info(`Saved S2S postback for ${reqPlatform} to MySQL.`);
+    const pool = getDbPool();
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS s2s_postbacks (
+        id VARCHAR(100) PRIMARY KEY,
+        platform VARCHAR(100),
+        click_id VARCHAR(255),
+        event VARCHAR(100),
+        player_id VARCHAR(100),
+        sum DECIMAL(10,2) DEFAULT 0.00,
+        currency VARCHAR(20),
+        rawQuery TEXT,
+        receivedAt VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+    await pool.query(
+      'INSERT INTO s2s_postbacks (id, platform, click_id, event, player_id, sum, currency, rawQuery, receivedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [postbackData.id, postbackData.platform, postbackData.click_id, postbackData.event, postbackData.player_id, postbackData.sum, postbackData.currency, JSON.stringify(postbackData.rawQuery), postbackData.receivedAt]
+    );
+    logger.info(`Saved S2S postback for ${reqPlatform} to MySQL database.`);
     
     // Also push to local state for temporary viewing in admin
     stateTrackLogs.unshift({
@@ -530,8 +858,8 @@ app.get('/api/image-optimize', async (req, res) => {
     return res.status(400).send('URL required');
   }
   
-  const width = parseInt(req.query.w) || 400;
-  const quality = parseInt(req.query.q) || 75;
+  const width = parseInt(String(req.query.w || '400'), 10) || 400;
+  const quality = parseInt(String(req.query.q || '75'), 10) || 75;
 
   try {
     const fetchRes = await fetch(url);
@@ -620,83 +948,116 @@ app.get('/api/admin/data', verifyJwtToken, (req, res) => {
 });
 
 // API: Submit Sub-Partner Application
-app.post('/api/sub-partners', (req, res) => {
-  const { fullName, email, whatsapp, platformId, platformName, trafficSource, estimatedMonthlyPlayers } = req.body;
+app.post('/api/sub-partners', async (req, res) => {
+  try {
+    const { fullName, email, whatsapp, platformId, platformName, trafficSource, estimatedMonthlyPlayers } = req.body;
 
-  if (!fullName || !email || !whatsapp) {
-    return res.status(400).json({ error: 'Name, email, and WhatsApp number are required' });
+    if (!fullName || !email || !whatsapp) {
+      return res.status(400).json({ error: 'Name, email, and WhatsApp number are required' });
+    }
+
+    const newApp: SubPartnerApplication = {
+      id: `sub_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      fullName: String(fullName).trim(),
+      email: String(email).trim(),
+      whatsapp: String(whatsapp).trim(),
+      platformId: platformId || '1win',
+      platformName: platformName || '1Win Casino',
+      trafficSource: trafficSource || 'Social Media',
+      estimatedMonthlyPlayers: estimatedMonthlyPlayers || '50-100 Players',
+      status: 'pending',
+      appliedAt: new Date().toISOString()
+    };
+
+    if (!Array.isArray(stateSubPartners)) {
+      stateSubPartners = [];
+    }
+
+    stateSubPartners.unshift(newApp);
+    stateStats.totalSubPartnerApps = (stateStats.totalSubPartnerApps || 0) + 1;
+
+    // Persist directly to MySQL
+    await insertSubPartnerToDb(newApp);
+    await updateStatsInDb();
+
+    logger.info(`New sub-partner application received: ${newApp.fullName} (${newApp.platformName})`);
+    return res.json({ success: true, application: newApp });
+  } catch (err) {
+    logger.error('Error submitting sub-partner application:', err);
+    return res.status(500).json({ error: 'Failed to process application' });
   }
-
-  const newApp: SubPartnerApplication = {
-    id: `sub_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`,
-    fullName,
-    email,
-    whatsapp,
-    platformId: platformId || '1win',
-    platformName: platformName || '1Win Casino',
-    trafficSource: trafficSource || 'Social Media',
-    estimatedMonthlyPlayers: estimatedMonthlyPlayers || '50-100 Players',
-    status: 'pending',
-    appliedAt: new Date().toISOString()
-  };
-
-  stateSubPartners.unshift(newApp);
-  stateStats.totalSubPartnerApps = (stateStats.totalSubPartnerApps || 0) + 1;
-
-  res.json({ success: true, application: newApp });
 });
 
 // API: Update Sub-Partner Status (Protected)
-app.patch('/api/admin/sub-partners/:id', verifyJwtToken, (req, res) => {
-  const { id } = req.params;
-  const { status } = req.body;
+app.patch('/api/admin/sub-partners/:id', verifyJwtToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
 
-  const appItem = stateSubPartners.find(s => s.id === id);
-  if (!appItem) {
-    return res.status(404).json({ error: 'Sub-partner application not found' });
+    const appItem = stateSubPartners.find(s => s.id === id);
+    if (!appItem) {
+      return res.status(404).json({ error: 'Sub-partner application not found' });
+    }
+
+    if (status) {
+      appItem.status = status;
+      await updateSubPartnerStatusInDb(appItem.id, status);
+    }
+
+    return res.json({ success: true, application: appItem });
+  } catch (err) {
+    logger.error('Error updating sub-partner status:', err);
+    return res.status(500).json({ error: 'Failed to update sub-partner status' });
   }
+});
 
-  if (status) {
-    appItem.status = status;
-    saveState();
+// API: Delete Sub-Partner Application (Protected)
+app.delete('/api/admin/sub-partners/:id', verifyJwtToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    stateSubPartners = stateSubPartners.filter(s => s.id !== id);
+    await deleteSubPartnerFromDb(id);
+    return res.json({ success: true, message: 'Sub-partner application removed' });
+  } catch (err) {
+    logger.error('Error deleting sub-partner application:', err);
+    return res.status(500).json({ error: 'Failed to delete sub-partner application' });
   }
-
-  res.json({ success: true, application: appItem });
 });
 
 // API: Save Platforms (Protected)
-app.post('/api/admin/platforms', verifyJwtToken, (req, res) => {
+app.post('/api/admin/platforms', verifyJwtToken, async (req, res) => {
   const { platforms } = req.body;
   if (Array.isArray(platforms)) {
-    statePlatforms = platforms; saveState();
+    statePlatforms = platforms;
+    await savePlatformsToDb(statePlatforms);
     return res.json({ success: true, platforms: statePlatforms });
   }
   return res.status(400).json({ error: 'Invalid platform data array' });
 });
 
-// API: Save Config (Protected)
-
-app.post('/api/admin/custom-pages', verifyJwtToken, express.json(), (req, res) => {
+// API: Save Custom Pages (Protected)
+app.post('/api/admin/custom-pages', verifyJwtToken, express.json(), async (req, res) => {
   const { pages } = req.body;
   if (Array.isArray(pages)) {
     stateCustomPages = pages;
-    saveState();
+    await saveCustomPagesToDb(stateCustomPages);
   }
   res.json({ success: true });
 });
 
-app.post('/api/admin/config', verifyJwtToken, (req, res) => {
+// API: Save Config (Protected)
+app.post('/api/admin/config', verifyJwtToken, async (req, res) => {
   const { config } = req.body;
   if (config) {
     stateConfig = { ...stateConfig, ...config };
-    saveState();
+    await saveConfigToDb(stateConfig);
     return res.json({ success: true, config: stateConfig });
   }
   return res.status(400).json({ error: 'Invalid config payload' });
 });
 
 // API: Track Conversion Events (Click / Copy / Spin)
-app.post('/api/track', (req, res) => {
+app.post('/api/track', async (req, res) => {
   const { eventType, platformId } = req.body;
   const geo = getGeoFromRequest(req);
 
@@ -723,6 +1084,10 @@ app.post('/api/track', (req, res) => {
 
   stateTrackLogs.unshift(logEntry);
   if (stateTrackLogs.length > 100) stateTrackLogs.pop();
+
+  // Async log & stats persistence to MySQL
+  insertTrackLogToDb(logEntry);
+  updateStatsInDb();
 
   res.json({ success: true });
 });

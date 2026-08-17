@@ -323,10 +323,27 @@ export default function App() {
         body: JSON.stringify({ status })
       });
       if (res.ok) {
-        setSubPartners(prev => prev.map(s => (s.id === id ? { ...s, status } : s)));
+        setSubPartners(prev => (prev || []).map(s => (s.id === id ? { ...s, status } : s)));
       }
     } catch (err) {
       console.error('Failed to update sub-partner status:', err);
+    }
+  };
+
+  // Delete Sub-Partner from Admin
+  const handleDeleteSubPartner = async (id: string) => {
+    try {
+      const res = await fetch(`/api/admin/sub-partners/${id}`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${adminToken}`
+        }
+      });
+      if (res.ok) {
+        setSubPartners(prev => (prev || []).filter(s => s.id !== id));
+      }
+    } catch (err) {
+      console.error('Failed to delete sub-partner application:', err);
     }
   };
 
@@ -514,6 +531,7 @@ export default function App() {
         onSavePlatforms={handleSavePlatformsFromAdmin}
         onSaveConfig={handleSaveConfigFromAdmin}
         onUpdateSubPartnerStatus={handleUpdateSubPartnerStatus}
+        onDeleteSubPartner={handleDeleteSubPartner}
         customPages={customPages}
         onSaveCustomPages={handleSaveCustomPagesFromAdmin}
       />

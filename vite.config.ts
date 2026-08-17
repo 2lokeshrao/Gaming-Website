@@ -13,7 +13,7 @@ export default defineConfig(() => {
     },
     build: {
       emptyOutDir: false,
-      minify: 'terser',
+      minify: 'terser' as const,
       terserOptions: {
         compress: {
           drop_console: true,

@@ -28,6 +28,7 @@ interface AdminPanelProps {
   onSavePlatforms: (updated: GamingPlatform[]) => void;
   onSaveConfig: (updatedConfig: GlobalConfig) => void;
   onUpdateSubPartnerStatus?: (id: string, status: 'approved' | 'contacted' | 'pending') => void;
+  onDeleteSubPartner?: (id: string) => void;
   customPages?: CustomPage[];
   onSaveCustomPages?: (pages: CustomPage[]) => void;
 }
@@ -52,6 +53,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   onSavePlatforms,
   onSaveConfig,
   onUpdateSubPartnerStatus,
+  onDeleteSubPartner,
   customPages,
   onSaveCustomPages
 }) => {
@@ -1778,9 +1780,23 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                               {onUpdateSubPartnerStatus && sub.status !== 'approved' && (
                                 <button
                                   onClick={() => onUpdateSubPartnerStatus(sub.id, 'approved')}
-                                  className="px-2.5 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-[11px] font-bold cursor-pointer"
+                                  className="px-2.5 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-[11px] font-bold cursor-pointer transition-colors"
                                 >
                                   Approve
+                                </button>
+                              )}
+
+                              {onDeleteSubPartner && (
+                                <button
+                                  onClick={() => {
+                                    if (window.confirm(`Delete application from ${sub.fullName}?`)) {
+                                      onDeleteSubPartner(sub.id);
+                                    }
+                                  }}
+                                  className="p-1 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 text-[11px] font-bold cursor-pointer transition-colors"
+                                  title="Delete Application"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
                                 </button>
                               )}
                             </div>
