@@ -1775,20 +1775,6 @@ const autoblogInterval = setInterval(async () => {
   }
 }, (stateConfig.autoBlogSettings?.intervalHours || 24) * 60 * 60 * 1000); // Default to checking daily, but interval updates when hours change.
 
-  const killPort = (port: string | number) => {
-    return new Promise<void>((resolve) => {
-      exec(`lsof -t -i:${port} | xargs kill -9`, (err1) => {
-        if (err1) {
-          exec(`fuser -k ${port}/tcp`, () => resolve());
-        } else {
-          resolve();
-        }
-      });
-    });
-  };
-
-  await killPort(PORT);
-  
   // Setup Sentry error handler BEFORE any other error middlewares, but AFTER all routes
   if (process.env.SENTRY_DSN) {
     Sentry.setupExpressErrorHandler(app);
