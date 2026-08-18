@@ -1786,11 +1786,7 @@ const autoblogInterval = setInterval(async () => {
 
   server.on('error', (e: any) => {
     if (e.code === 'EADDRINUSE') {
-      logger.error(`Port ${PORT} is in use, retrying...`);
-      setTimeout(() => {
-        server.close();
-        server.listen(PORT, '0.0.0.0');
-      }, 1000);
+      logger.error(`Port ${PORT} is already in use.`);
     } else {
       logger.error('Server error:', e);
     }
